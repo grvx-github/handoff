@@ -4,7 +4,7 @@ const log = require('./logger'), { Meeting, ActionItem, Doc } = require('./model
 
 const app = express();
 app.use(express.static(path.join(__dirname, '../public')));
-app.use(express.json({ limit: '200kb' }));
+app.use(express.json({ limit: '10mb' }));
 app.use((req, res, next) => { // correlation id + request log
   req.id = req.get('x-request-id') || randomUUID(); res.set('x-request-id', req.id);
   req.log = log.child({ requestId: req.id }); const t = Date.now();
@@ -120,6 +120,44 @@ app.post('/api/actions/:id/nudge', h(async (req, res) => {
 // ---- knowledge base
 app.get('/api/docs', h(async (req, res) => res.json(await Doc.find().sort('title'))));
 app.post('/api/docs', h(async (req, res) => { const d = await Doc.create(parse(docIn, req.body)); req.log.info({ docId: d.id }, 'doc.created'); res.status(201).json(d); }));
+
+// ---- import a document into a meeting (AI fills the fields; the user reviews before saving)
+const importIn = z.object({ filename: z.string().trim().min(1).max(200).default('pasted text'), mimeType: z.string().optional(), data: z.string().optional(), text: z.string().optional() })
+  .refine(b => b.data || (b.text && b.text.trim().length >= 20), 'Provide a file or at least 20 characters of text');
+app.post('/api/meetings/import/preview', h(async (req, res) => {
+  const b = parse(importIn, req.body), ext = path.extname(b.filename).toLowerCase();
+  let text = (b.text || '').trim(), file = null;
+  if (b.data) {
+    const buf = Buffer.from(b.data, 'base64');
+    if (ext === '.pdf' || b.mimeType === 'application/pdf') file = { mimeType: 'application/pdf', data: b.data };
+    else if (ext === '.docx') text = (await require('mammoth').extractRawText({ buffer: buf }).catch(() => { throw new HttpError(400, 'Could not read this DOCX file'); })).value.trim();
+    else if (['.txt', '.md', '.csv', '.json', '.log'].includes(ext)) text = buf.toString('utf8').trim();
+    else throw new HttpError(415, 'Unsupported file type. Use PDF, DOCX, TXT or MD');
+  }
+  if (!file && text.length < 20) throw new HttpError(400, 'The document has no readable text');
+  text = text.slice(0, 45000);
+  const out = await ai.extractMeeting({ text: file ? '' : text, file, filename: b.filename }, req.log);
+  if (!out) throw new HttpError(503, 'AI is unavailable and PDFs need it. Paste the text instead.');
+  req.log.info({ filename: b.filename, chars: text.length, degraded: out.degraded }, 'meeting.import_previewed');
+  res.json({ ...out, rawNotes: text || `Imported from ${b.filename}` });
+}));
+
+// ---- ask the knowledge base: answers grounded in documents and past meetings
+app.post('/api/ask', h(async (req, res) => {
+  const { question } = parse(z.object({ question: z.string().trim().min(3).max(500) }), req.body);
+  const [docs, ms, items] = await Promise.all([Doc.find().lean(), Meeting.find().sort('-createdAt').lean(), ActionItem.find({ status: { $ne: 'carried' } }).lean()]);
+  const sources = [
+    ...docs.map((d, i) => ({ id: 'D' + (i + 1), kind: 'document', title: d.title, refId: String(d._id), text: d.content })),
+    ...ms.map((m, i) => ({ id: 'M' + (i + 1), kind: 'meeting', title: m.title, refId: String(m._id), text: [
+      m.summary && 'Summary: ' + m.summary, (m.decisions || []).length && 'Decisions: ' + m.decisions.join('; '),
+      ...items.filter(a => String(a.meetingId) === String(m._id)).map(a => `Action item: ${a.title} (owner ${a.owner || 'unassigned'}, status ${a.status}${a.dueDate ? ', due ' + a.dueDate.toISOString().slice(0, 10) : ''}${a.outcome ? ', outcome: ' + a.outcome : ''})`),
+      !m.summary && (m.rawNotes || '').slice(0, 2000)].filter(Boolean).join('\n') }))
+  ];
+  if (!sources.length) return res.json({ answer: 'The knowledge base is empty. Add a document or save a meeting recap first.', sources: [], degraded: false });
+  const out = await ai.answer(question, sources, req.log);
+  req.log.info({ questionChars: question.length, sources: out.sources.length, degraded: out.degraded }, 'knowledge.asked');
+  res.json({ answer: out.answer, degraded: out.degraded, sources: out.sources.map(({ id, kind, title, refId }) => ({ id, kind, title, refId })) });
+}));
 
 app.use('/api', (req, res, next) => next(new HttpError(404, 'Not found')));
 app.use((e, req, res, next) => { // eslint-disable-line
